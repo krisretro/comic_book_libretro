@@ -17,6 +17,7 @@
 #define MAX_H 1440
 /* --- New Includes for PDF --- */
 #include <mupdf/fitz.h>
+#include <mupdf/pdf.h>
 typedef struct { unsigned char *pixels; int w, h; } PageData;
 typedef struct { char *filename; bool is_right_half; } VirtualPage;
 typedef struct {
@@ -81,6 +82,7 @@ static unsigned char* render_pdf_page(int page_num, int *w, int *h) {
    
     int max_pages = fz_count_pages(pdf_ctx, pdf_doc);
     if (page_num < 0 || page_num >= max_pages) return NULL;
+    
     fz_pixmap *pix = NULL;
     unsigned char *output = NULL;
    
@@ -91,21 +93,47 @@ static unsigned char* render_pdf_page(int page_num, int *w, int *h) {
         float scale = (float)cur_height / (rect.y1 - rect.y0);
         fz_matrix ctm = fz_scale(scale, scale);
        
-        pix = fz_new_pixmap_from_page(pdf_ctx, page, ctm, fz_device_rgb(pdf_ctx), 0);
+        fz_rect trect = fz_transform_rect(rect, ctm);
+        fz_irect irect = fz_round_rect(trect);
+        
+        // Use 1 for Alpha channel to handle layered transparency
+        pix = fz_new_pixmap_with_bbox(pdf_ctx, fz_device_rgb(pdf_ctx), irect, NULL, 1);
+        fz_clear_pixmap_with_value(pdf_ctx, pix, 255); // Solid white background
+        
+        fz_device *dev = fz_new_draw_device(pdf_ctx, ctm, pix);
+        
+       /* 1. Render the base content */
+        fz_run_page(pdf_ctx, page, dev, fz_identity, NULL);
+        
+        /* 2. Render the annotations using the pdf_ prefix */
+        pdf_annot *annot;
+        pdf_page *pdf_p = pdf_page_from_fz_page(pdf_ctx, page);
+        
+        if (pdf_p) {
+            for (annot = pdf_first_annot(pdf_ctx, pdf_p); annot; annot = pdf_next_annot(pdf_ctx, annot)) {
+                pdf_run_annot(pdf_ctx, annot, dev, fz_identity, NULL);
+            }
+        }
+        
+        fz_close_device(pdf_ctx, dev);
+        fz_drop_device(pdf_ctx, dev);
+        
         *w = fz_pixmap_width(pdf_ctx, pix);
         *h = fz_pixmap_height(pdf_ctx, pix);
        
         output = malloc((*w) * (*h) * 4);
         unsigned char *s = fz_pixmap_samples(pdf_ctx, pix);
         int stride = fz_pixmap_stride(pdf_ctx, pix);
+        int n = fz_pixmap_components(pdf_ctx, pix);
+        
         for (int y = 0; y < *h; y++) {
             for (int x = 0; x < *w; x++) {
-                unsigned char *src = s + (y * stride) + (x * 3);
+                unsigned char *src = s + (y * stride) + (x * n);
                 unsigned char *dst = output + (y * (*w) * 4) + (x * 4);
-                dst[0] = src[0];
-                dst[1] = src[1];
-                dst[2] = src[2];
-                dst[3] = 255;
+                dst[0] = src[0]; // R
+                dst[1] = src[1]; // G
+                dst[2] = src[2]; // B
+                dst[3] = 255;    // A
             }
         }
        
@@ -152,6 +180,71 @@ static void analyze_page(PageData *img) {
     }
     auto_min = min_l; auto_max = max_l;
 }
+
+/* Helper to construct a .cfg path alongside the opened comic file */
+static void get_comic_cfg_path(char *out_path, size_t max_len) {
+    if (archive_path[0] == '\0') return;
+
+    strncpy(out_path, archive_path, max_len - 1);
+    out_path[max_len - 1] = '\0';
+
+    // Find the last extension dot
+    char *dot = strrchr(out_path, '.');
+    // Ensure we only strip the extension of the filename, not parent directories
+    char *slash = strrchr(out_path, '/');
+#ifdef _WIN32
+    char *bslash = strrchr(out_path, '\\');
+    if (bslash && (!slash || bslash > slash)) slash = bslash;
+#endif
+
+    if (dot && (!slash || dot > slash)) {
+        *dot = '\0'; // Strip extension (.cbz, .cbr, .pdf, etc.)
+    }
+
+    // Append .cfg extension
+    strncat(out_path, ".cfg", max_len - strlen(out_path) - 1);
+}
+
+static void save_comic_settings() {
+    char cfg_path[1024] = {0};
+    get_comic_cfg_path(cfg_path, sizeof(cfg_path));
+    if (cfg_path[0] == '\0') return;
+
+    FILE *f = fopen(cfg_path, "w");
+    if (f) {
+        fprintf(f, "brightness=%d\n", brightness);
+        fprintf(f, "contrast=%.2f\n", contrast);
+        fprintf(f, "sharpness=%.2f\n", sharpness);
+        fprintf(f, "auto_contrast=%d\n", auto_contrast ? 1 : 0);
+        fprintf(f, "render_mode=%d\n", render_mode);
+        fclose(f);
+    }
+}
+
+static void load_comic_settings() {
+    char cfg_path[1024] = {0};
+    get_comic_cfg_path(cfg_path, sizeof(cfg_path));
+    if (cfg_path[0] == '\0') return;
+
+    FILE *f = fopen(cfg_path, "r");
+    if (f) {
+        if (fscanf(f, "brightness=%d\n", &brightness) != 1) brightness = 0;
+        if (fscanf(f, "contrast=%f\n", &contrast) != 1) contrast = 1.0f;
+        if (fscanf(f, "sharpness=%f\n", &sharpness) != 1) sharpness = 0.0f;
+        int auto_c = 0;
+        if (fscanf(f, "auto_contrast=%d\n", &auto_c) == 1) auto_contrast = (auto_c != 0);
+        if (fscanf(f, "render_mode=%d\n", &render_mode) != 1) render_mode = 0;
+        fclose(f);
+    } else {
+        // Reset to defaults if no config exists for this specific book
+        brightness = 0;
+        contrast = 1.0f;
+        sharpness = 0.0f;
+        auto_contrast = false;
+        render_mode = 0;
+    }
+}
+
 static inline uint16_t process_pixel(int r, int g, int b) {
     if (auto_contrast) {
         float range = (auto_max - auto_min);
@@ -629,7 +722,7 @@ bool retro_load_game(const struct retro_game_info *info) {
     strncpy(archive_path, info->path, 1023);
    
     game_loaded = true;
-  
+  load_comic_settings(); // <--- Load per-book settings right after getting archive_path
     rebuild_index();
     refresh();
     return true;
@@ -719,6 +812,7 @@ bool retro_unserialize(const void *data, size_t size)
     return true;
 }
 void retro_unload_game(void) {
+	save_comic_settings(); // <--- Save per-book settings before cleaning up memory
     game_loaded = false;
     vars_initialized = false; // CRITICAL: Reset this so the next book forces a fresh env-call
    
